@@ -135,6 +135,75 @@ def build_sequences(
 	)
 
 
+def build_sequences_all_data(
+	df: pd.DataFrame,
+	time_steps: int,
+	feature_cols: List[str],
+	target_cols: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Build sliding window sequences using ALL data for training (no test split).
+	
+	Args:
+		df: DataFrame with features and targets
+		time_steps: Number of time steps in the sequence
+		feature_cols: List of feature column names
+		target_cols: List of target column names
+	Returns:
+		X_train, y_train
+	"""
+	X_train: List[np.ndarray] = []
+	y_train: List[np.ndarray] = []
+
+	for noc, g in df.groupby("NOC"):
+		g = g.sort_values("Year")
+		feats = g[feature_cols].to_numpy(dtype=float)
+		targets = g[target_cols].to_numpy(dtype=float)
+
+		# Use all available sequences
+		for i in range(len(g) - time_steps):
+			window = feats[i : i + time_steps]
+			target = targets[i + time_steps]
+			X_train.append(window)
+			y_train.append(target)
+
+	return (
+		np.array(X_train, dtype=float),
+		np.array(y_train, dtype=float),
+	)
+
+
+def get_prediction_sequences(
+	df: pd.DataFrame,
+	time_steps: int,
+	feature_cols: List[str],
+) -> Tuple[np.ndarray, List[str]]:
+	"""Get the last time_steps years of features for each country for prediction.
+	
+	Args:
+		df: DataFrame with features
+		time_steps: Number of time steps in the sequence
+		feature_cols: List of feature column names
+	Returns:
+		X_pred: Array of shape (n_countries, time_steps, n_features)
+		noc_list: List of NOC codes in the same order as X_pred
+	"""
+	X_pred: List[np.ndarray] = []
+	noc_list: List[str] = []
+
+	for noc, g in df.groupby("NOC"):
+		g = g.sort_values("Year")
+		feats = g[feature_cols].to_numpy(dtype=float)
+		
+		# Only include countries that have at least time_steps years of data
+		if len(g) >= time_steps:
+			# Get the last time_steps years
+			window = feats[-time_steps:]
+			X_pred.append(window)
+			noc_list.append(noc)
+
+	return np.array(X_pred, dtype=float), noc_list
+
+
 def main() -> None:
 	time_steps = 3
 
@@ -252,5 +321,125 @@ def main() -> None:
 	print(results.nlargest(10, "actual_gold")[["NOC", "Year", "actual_gold", "pred_gold", "actual_silver", "pred_silver", "actual_bronze", "pred_bronze"]])
 
 
+def predict_2028() -> None:
+	"""Train on all data and predict 2028 medal counts for all countries."""
+	time_steps = 3
+	target_year = 2028
+
+	# Load data
+	df = pd.read_csv(DATA_CSV)
+	
+	# Identify feature columns (exclude Year, NOC, and target columns)
+	target_cols = ["Gold", "Silver", "Bronze"]
+	exclude_cols = ["Year", "NOC", "Gold", "Silver", "Bronze", "Total"]
+	feature_cols = [col for col in df.columns if col not in exclude_cols]
+	
+	print(f"Feature columns ({len(feature_cols)}): {feature_cols}")
+	print(f"Target columns: {target_cols}")
+	
+	# Get unique years
+	unique_years = sorted(df["Year"].unique())
+	print(f"All years in data: {unique_years}")
+	
+	# Build sequences using ALL data (no test split)
+	X_train, y_train = build_sequences_all_data(
+		df, time_steps, feature_cols, target_cols
+	)
+
+	if X_train.size == 0:
+		raise ValueError("No training samples were created; check data alignment.")
+
+	print(f"Training samples (all data): {len(X_train)}")
+
+	# Scale features across all time steps
+	scaler = StandardScaler()
+	n_features = len(feature_cols)
+	X_train_flat = X_train.reshape(-1, n_features)
+	scaler.fit(X_train_flat)
+	X_train_scaled = scaler.transform(X_train_flat).reshape(X_train.shape)
+
+	# Setup model and training
+	device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+	print(f"Using device: {device}")
+	
+	model = TorchLSTM(time_steps, n_features, n_targets=3).to(device)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+	loss_fn = WeightedHuberLoss(medal_weights=(3.0, 2.0, 1.0), delta=1.0).to(device)
+	epochs = 100
+
+	X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
+	y_train_t = torch.tensor(y_train, dtype=torch.float32)
+	train_ds = torch.utils.data.TensorDataset(X_train_t, y_train_t)
+	train_loader = torch.utils.data.DataLoader(train_ds, batch_size=64, shuffle=True)
+
+	# Training loop
+	print("\nTraining on all data...")
+	for epoch in range(epochs):
+		model.train()
+		epoch_loss = 0.0
+		for xb, yb in train_loader:
+			xb = xb.to(device)
+			yb = yb.to(device)
+			optimizer.zero_grad()
+			pred = model(xb)
+			loss = loss_fn(pred, yb)
+			loss.backward()
+			optimizer.step()
+			epoch_loss += loss.item() * xb.size(0)
+		epoch_loss /= len(train_loader.dataset)
+		if (epoch + 1) % 10 == 0:
+			print(f"Epoch {epoch+1:03d} | train loss {epoch_loss:.4f}")
+
+	# Get prediction sequences (last time_steps years for each country)
+	X_pred, noc_list = get_prediction_sequences(df, time_steps, feature_cols)
+	
+	if X_pred.size == 0:
+		raise ValueError("No prediction sequences were created; check data alignment.")
+	
+	print(f"\nPredicting for {target_year}...")
+	print(f"Countries with sufficient data: {len(noc_list)}")
+
+	# Scale prediction sequences
+	X_pred_flat = X_pred.reshape(-1, n_features)
+	X_pred_scaled = scaler.transform(X_pred_flat).reshape(X_pred.shape)
+	X_pred_t = torch.tensor(X_pred_scaled, dtype=torch.float32).to(device)
+
+	# Make predictions
+	model.eval()
+	with torch.no_grad():
+		preds = model(X_pred_t).cpu().numpy()
+
+	# Create results DataFrame
+	results = pd.DataFrame(
+		{
+			"NOC": noc_list,
+			"Year": target_year,
+			"pred_gold": preds[:, 0],
+			"pred_silver": preds[:, 1],
+			"pred_bronze": preds[:, 2],
+		}
+	)
+
+	# Round predictions to nearest integer (medals must be whole numbers)
+	results["pred_gold"] = results["pred_gold"].round().astype(int).clip(lower=0)
+	results["pred_silver"] = results["pred_silver"].round().astype(int).clip(lower=0)
+	results["pred_bronze"] = results["pred_bronze"].round().astype(int).clip(lower=0)
+	results["pred_total"] = results["pred_gold"] + results["pred_silver"] + results["pred_bronze"]
+
+	results = results.sort_values("pred_total", ascending=False)
+	os.makedirs(os.path.join(os.path.dirname(__file__), "outputs"), exist_ok=True)
+	out_path = os.path.join(os.path.dirname(__file__), "outputs", f"lstm_pred_{target_year}.csv")
+	results.to_csv(out_path, index=False)
+
+	print(f"\n{'='*60}")
+	print(f"Predictions for {target_year}")
+	print(f"Total countries predicted: {len(results)}")
+	print(f"Saved predictions to {out_path}")
+	print(f"\nTop 20 countries by predicted total medals:")
+	print(results.head(20)[["NOC", "pred_gold", "pred_silver", "pred_bronze", "pred_total"]])
+	print(f"\nTop 20 countries by predicted gold medals:")
+	print(results.nlargest(20, "pred_gold")[["NOC", "pred_gold", "pred_silver", "pred_bronze", "pred_total"]])
+
+
 if __name__ == "__main__":
-	main()
+	predict_2028()

@@ -168,6 +168,93 @@ def build_sequences(
 	)
 
 
+def build_sequences_all_data(
+	df: pd.DataFrame,
+	time_steps: int,
+	feature_cols: List[str],
+	target_cols: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Build sliding window sequences using ALL data for training (no test split).
+	
+	Args:
+		df: DataFrame with features and targets
+		time_steps: Number of time steps in the sequence
+		feature_cols: List of feature column names
+		target_cols: List of target column names
+	Returns:
+		X_train, y_train
+	"""
+	X_train: List[np.ndarray] = []
+	y_train: List[np.ndarray] = []
+
+	for team, g in df.groupby("team"):
+		g = g.sort_values("year")
+		feats = g[feature_cols].to_numpy(dtype=float)
+		targets = g[target_cols].to_numpy(dtype=float)
+
+		# Use all available sequences
+		for i in range(len(g) - time_steps):
+			window = feats[i : i + time_steps]
+			target = targets[i + time_steps]
+			X_train.append(window)
+			y_train.append(target)
+
+	return (
+		np.array(X_train, dtype=float),
+		np.array(y_train, dtype=float),
+	)
+
+
+def get_prediction_sequences(
+	df: pd.DataFrame,
+	time_steps: int,
+	feature_cols: List[str],
+	target_year: int,
+	hosts_df: pd.DataFrame,
+) -> Tuple[np.ndarray, List[str], pd.DataFrame]:
+	"""Get the last time_steps years of features for each country for prediction.
+	
+	Args:
+		df: DataFrame with features
+		time_steps: Number of time steps in the sequence
+		feature_cols: List of feature column names
+		target_year: Year to predict for
+		hosts_df: DataFrame with host information
+	Returns:
+		X_pred: Array of shape (n_countries, time_steps, n_features)
+		team_list: List of team names in the same order as X_pred
+		features_df: DataFrame with the features used for prediction (for debugging)
+	"""
+	X_pred: List[np.ndarray] = []
+	team_list: List[str] = []
+	features_list: List[Dict] = []
+
+	# Get host country for target year
+	host_info = hosts_df[hosts_df["year"] == target_year]
+	host_country = ""
+	if not host_info.empty:
+		host_country = host_info.iloc[0]["host_country"]
+
+	for team, g in df.groupby("team"):
+		g = g.sort_values("year")
+		feats = g[feature_cols].to_numpy(dtype=float)
+		
+		# Only include countries that have at least time_steps years of data
+		if len(g) >= time_steps:
+			# Get the last time_steps years of actual historical data
+			window = feats[-time_steps:]
+			
+			# Store feature info for debugging
+			last_row = g.iloc[-1].copy()
+			feature_dict = {col: last_row[col] for col in feature_cols}
+			features_list.append(feature_dict)
+			
+			X_pred.append(window)
+			team_list.append(team)
+
+	return np.array(X_pred, dtype=float), team_list, pd.DataFrame(features_list)
+
+
 class TorchLSTM(torch.nn.Module):
 	def __init__(self, time_steps: int, n_features: int, n_targets: int = 3):
 		super().__init__()
@@ -184,50 +271,178 @@ class TorchLSTM(torch.nn.Module):
 		return self.head(x)
 
 
-class WeightedHuberLoss(torch.nn.Module):
-	"""Huber Loss with different weights for gold, silver, bronze medals.
+# class WeightedHuberLoss(torch.nn.Module):
+# 	"""Huber Loss with different weights for gold, silver, bronze medals.
 	
-	Huber Loss is more sensitive to outliers than MSE while being smoother than MAE.
-	Weights: gold > silver > bronze to emphasize the importance of gold medals.
-	"""
-	def __init__(self, medal_weights: Tuple[float, float, float] = (3.0, 2.0, 1.0), delta: float = 1.0):
-		super().__init__()
-		self.medal_weights = torch.tensor(medal_weights, dtype=torch.float32)
-		self.delta = delta
+# 	Huber Loss is more sensitive to outliers than MSE while being smoother than MAE.
+# 	Weights: gold > silver > bronze to emphasize the importance of gold medals.
+# 	"""
+# 	def __init__(self, medal_weights: Tuple[float, float, float] = (3.0, 2.0, 1.0), delta: float = 1.0):
+# 		super().__init__()
+# 		self.medal_weights = torch.tensor(medal_weights, dtype=torch.float32)
+# 		self.delta = delta
 
-	def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-		"""
-		Args:
-			pred: (batch_size, 3) predictions [gold, silver, bronze]
-			target: (batch_size, 3) targets [gold, silver, bronze]
-		Returns:
-			Weighted Huber loss
-		"""
-		device = pred.device
-		weights = self.medal_weights.to(device)
+# 	def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+# 		"""
+# 		Args:
+# 			pred: (batch_size, 3) predictions [gold, silver, bronze]
+# 			target: (batch_size, 3) targets [gold, silver, bronze]
+# 		Returns:
+# 			Weighted Huber loss
+# 		"""
+# 		device = pred.device
+# 		weights = self.medal_weights.to(device)
 		
-		# Calculate Huber loss for each medal type
-		error = pred - target
-		abs_error = torch.abs(error)
+# 		# Calculate Huber loss for each medal type
+# 		error = pred - target
+# 		abs_error = torch.abs(error)
 		
-		# Huber loss: quadratic for small errors, linear for large errors
-		huber_loss = torch.where(
-			abs_error <= self.delta,
-			0.5 * error ** 2,
-			self.delta * (abs_error - 0.5 * self.delta)
-		)
+# 		# Huber loss: quadratic for small errors, linear for large errors
+# 		huber_loss = torch.where(
+# 			abs_error <= self.delta,
+# 			0.5 * error ** 2,
+# 			self.delta * (abs_error - 0.5 * self.delta)
+# 		)
 		
-		# Apply weights: gold gets highest weight
-		weighted_loss = huber_loss * weights.unsqueeze(0)
+# 		# Apply weights: gold gets highest weight
+# 		weighted_loss = huber_loss * weights.unsqueeze(0)
 		
-		# Give higher weight to samples with larger medal counts (to emphasize extremes)
-		# Use a more aggressive weighting: 1.0 + 0.2 * total_medals + 0.01 * total_medals^2
-		# This quadratically increases weight for high medal counts
-		total_medals = target.sum(dim=1, keepdim=True)
-		sample_weights = 1.0 + 0.2 * total_medals + 0.01 * (total_medals ** 2)
-		weighted_loss = weighted_loss * sample_weights
+# 		# Give higher weight to samples with larger medal counts (to emphasize extremes)
+# 		# Use a more aggressive weighting: 1.0 + 0.2 * total_medals + 0.01 * total_medals^2
+# 		# This quadratically increases weight for high medal counts
+# 		total_medals = target.sum(dim=1, keepdim=True)
+# 		sample_weights = 1.0 + 0.2 * total_medals + 0.01 * (total_medals ** 2)
+# 		weighted_loss = weighted_loss * sample_weights
 		
-		return weighted_loss.mean()
+# 		return weighted_loss.mean()
+
+
+def predict_2028() -> None:
+	"""Train on all data and predict 2028 medal counts for all countries."""
+	time_steps = 3
+	target_year = 2028
+
+	df = merge_features()
+	unique_years = sorted(df["year"].unique())
+	print(f"All years in data: {unique_years}")
+	
+	# Load hosts data separately for 2028 prediction
+	hosts_df = load_hosts(HOSTS_CSV)
+	
+	feature_cols = [
+		"gold",
+		"silver",
+		"bronze",
+		"total",
+		"athlete_count",
+		"medalist_count",
+		"conversion_rate",
+		"sport_count",
+		"event_count",
+		"returning_ratio",
+		"total_events",
+		"is_host",
+	]
+	target_cols = ["gold", "silver", "bronze"]
+
+	# Build sequences using ALL data (no test split)
+	X_train, y_train = build_sequences_all_data(
+		df, time_steps, feature_cols, target_cols
+	)
+
+	if X_train.size == 0:
+		raise ValueError("No training samples were created; check data alignment.")
+
+	print(f"Training samples (all data): {len(X_train)}")
+
+	# Scale features across all time steps
+	scaler = StandardScaler()
+	n_features = len(feature_cols)
+	X_train_flat = X_train.reshape(-1, n_features)
+	scaler.fit(X_train_flat)
+	X_train_scaled = scaler.transform(X_train_flat).reshape(X_train.shape)
+
+	# Setup model and training
+	device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+	print(f"Using device: {device}")
+	
+	model = TorchLSTM(time_steps, n_features, n_targets=3).to(device)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+	loss_fn = torch.nn.MSELoss()
+	epochs = 100
+
+	X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
+	y_train_t = torch.tensor(y_train, dtype=torch.float32)
+	train_ds = torch.utils.data.TensorDataset(X_train_t, y_train_t)
+	train_loader = torch.utils.data.DataLoader(train_ds, batch_size=64, shuffle=True)
+
+	# Training loop
+	print("\nTraining on all data...")
+	for epoch in range(epochs):
+		model.train()
+		epoch_loss = 0.0
+		for xb, yb in train_loader:
+			xb = xb.to(device)
+			yb = yb.to(device)
+			optimizer.zero_grad()
+			pred = model(xb)
+			loss = loss_fn(pred, yb)
+			loss.backward()
+			optimizer.step()
+			epoch_loss += loss.item() * xb.size(0)
+		epoch_loss /= len(train_loader.dataset)
+		if (epoch + 1) % 10 == 0:
+			print(f"Epoch {epoch+1:03d} | train loss {epoch_loss:.4f}")
+
+	# Get prediction sequences (last time_steps years for each country)
+	X_pred, team_list, features_df = get_prediction_sequences(df, time_steps, feature_cols, target_year, hosts_df)
+	
+	if X_pred.size == 0:
+		raise ValueError("No prediction sequences were created; check data alignment.")
+	
+	print(f"\nPredicting for {target_year}...")
+	print(f"Countries with sufficient data: {len(team_list)}")
+
+	# Scale prediction sequences
+	X_pred_flat = X_pred.reshape(-1, n_features)
+	X_pred_scaled = scaler.transform(X_pred_flat).reshape(X_pred.shape)
+	X_pred_t = torch.tensor(X_pred_scaled, dtype=torch.float32).to(device)
+
+	# Make predictions
+	model.eval()
+	with torch.no_grad():
+		preds = model(X_pred_t).cpu().numpy()
+
+	# Create results DataFrame
+	results = pd.DataFrame(
+		{
+			"team": team_list,
+			"year": target_year,
+			"pred_gold": preds[:, 0],
+			"pred_silver": preds[:, 1],
+			"pred_bronze": preds[:, 2],
+		}
+	)
+
+	# Round predictions to nearest integer (medals must be whole numbers)
+	results["pred_gold"] = results["pred_gold"].round().astype(int).clip(lower=0)
+	results["pred_silver"] = results["pred_silver"].round().astype(int).clip(lower=0)
+	results["pred_bronze"] = results["pred_bronze"].round().astype(int).clip(lower=0)
+	results["pred_total"] = results["pred_gold"] + results["pred_silver"] + results["pred_bronze"]
+
+	results = results.sort_values("pred_total", ascending=False)
+	os.makedirs(os.path.join(os.path.dirname(__file__), "outputs"), exist_ok=True)
+	out_path = os.path.join(os.path.dirname(__file__), "outputs", f"lstm_pred_{target_year}.csv")
+	results.to_csv(out_path, index=False)
+
+	print(f"\n{'='*60}")
+	print(f"Predictions for {target_year}")
+	print(f"Total countries predicted: {len(results)}")
+	print(f"Saved predictions to {out_path}")
+	print(f"\nTop 20 countries by predicted total medals:")
+	print(results.head(20)[["team", "pred_gold", "pred_silver", "pred_bronze", "pred_total"]])
+	print(f"\nTop 20 countries by predicted gold medals:")
+	print(results.nlargest(20, "pred_gold")[["team", "pred_gold", "pred_silver", "pred_bronze", "pred_total"]])
 
 
 def main() -> None:
@@ -276,7 +491,7 @@ def main() -> None:
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 	# Use weighted Huber loss: gold (3.0) > silver (2.0) > bronze (1.0)
 	# Huber loss is more sensitive to outliers than MSE
-	loss_fn = WeightedHuberLoss(medal_weights=(3.0, 2.0, 1.0), delta=1.0).to(device)
+	loss_fn = torch.nn.MSELoss().to(device)
 	epochs = 100
 
 	X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
@@ -338,4 +553,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-	main()
+	predict_2028()
